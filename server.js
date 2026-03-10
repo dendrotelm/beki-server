@@ -5,103 +5,191 @@ const cors = require('cors');
 
 const app = express();
 app.use(cors());
+
 const server = http.createServer(app);
-const io = new Server(server, { cors: { origin: "*", methods: ["GET", "POST"] } });
-
-const rooms = {};
-const playersDb = {}; 
-
-function generateRoomId() { return Math.random().toString(36).substring(2, 6).toUpperCase(); }
-function generateGuestName() { return 'Gracz_' + Math.floor(Math.random() * 10000); }
-
-function updateElo(winnerElo, loserElo) {
-    const k = 32; 
-    const expectedWin = 1 / (1 + Math.pow(10, (loserElo - winnerElo) / 400));
-    const newWinnerElo = Math.round(winnerElo + k * (1 - expectedWin));
-    const newLoserElo = Math.round(loserElo + k * (0 - (1 - expectedWin)));
-    return { newWinnerElo, newLoserElo: Math.max(0, newLoserElo) };
-}
-
-function broadcastLeaderboard() {
-    const topPlayers = Object.values(playersDb).sort((a, b) => b.elo - a.elo).slice(0, 10);
-    io.emit('leaderboardData', topPlayers);
-}
-
-io.on('connection', (socket) => {
-  try {
-      if (!playersDb[socket.id]) {
-          playersDb[socket.id] = { id: socket.id, name: generateGuestName(), elo: 1200 };
-      }
-
-      socket.on('getPlayerData', () => {
-        if (playersDb[socket.id]) socket.emit('playerData', playersDb[socket.id]);
-      });
-
-      socket.on('getLeaderboard', () => { broadcastLeaderboard(); });
-
-      socket.on('createRoom', (data = {}) => {
-        const roomId = generateRoomId();
-        const limit = data.limit || 5;
-        const is2v2 = !!data.is2v2;
-        rooms[roomId] = { id: roomId, host: socket.id, clients: [], is2v2, limit, matchOver: false };
-        socket.join(roomId);
-        socket.emit('roomCreated', { roomId, role: 'p1' });
-      });
-
-      socket.on('joinRoom', (data) => {
-        if (!data || !data.roomId) return socket.emit('errorMsg', 'Brak kodu pokoju!');
-        const id = data.roomId.toUpperCase();
-        const room = rooms[id];
-        
-        if (room) {
-          const maxClients = room.is2v2 ? 3 : 1;
-          if (room.clients.length < maxClients) {
-            const role = room.is2v2 ? ['p2', 'p3', 'p4'][room.clients.length] : 'p2';
-            room.clients.push({ id: socket.id, role });
-            socket.join(id);
-            socket.emit('joinedRoom', { roomId: id, role });
-            io.to(id).emit('lobbyUpdate', { joined: room.clients.length + 1, max: maxClients + 1 });
-            if (room.clients.length === maxClients) { io.to(id).emit('gameStarted', { limit: room.limit, is2v2: room.is2v2 }); }
-          } else { socket.emit('errorMsg', 'Pokój pełny!'); }
-        } else { socket.emit('errorMsg', 'Pokój nie istnieje!'); }
-      });
-
-      socket.on('hostState', (data) => { if(data && data.roomId && data.state) socket.to(data.roomId).emit('gameState', data.state); });
-      socket.on('clientInput', (data) => { if(data && data.roomId) socket.to(data.roomId).emit('opponentInput', { role: data.role, input: data.input }); });
-      socket.on('gameEvent', (data) => { if(data && data.roomId) socket.to(data.roomId).emit('triggerEvent', data); });
-      socket.on('chatMessage', (msg) => { if(msg && msg.roomId) io.to(msg.roomId).emit('chatMessage', msg); });
-
-      socket.on('matchComplete', (data) => {
-        if (!data || !data.roomId || !data.winnerTeam) return;
-        const room = rooms[data.roomId];
-        if (room && !room.matchOver) {
-            room.matchOver = true; 
-            let teamA = [room.host]; let teamB = [];
-            room.clients.forEach(c => { if(c.role === 'p3') teamA.push(c.id); else teamB.push(c.id); });
-            const winners = data.winnerTeam === 'a' ? teamA : teamB;
-            const losers = data.winnerTeam === 'a' ? teamB : teamA;
-
-            let avgWinnerElo = winners.length > 0 ? winners.reduce((sum, id) => sum + (playersDb[id]?.elo || 1200), 0) / winners.length : 1200;
-            let avgLoserElo = losers.length > 0 ? losers.reduce((sum, id) => sum + (playersDb[id]?.elo || 1200), 0) / losers.length : 1200;
-
-            const { newWinnerElo, newLoserElo } = updateElo(avgWinnerElo, avgLoserElo);
-            winners.forEach(id => { if(playersDb[id]) { playersDb[id].elo += (newWinnerElo - avgWinnerElo); io.to(id).emit('playerData', playersDb[id]); } });
-            losers.forEach(id => { if(playersDb[id]) { playersDb[id].elo -= (avgLoserElo - newLoserElo); io.to(id).emit('playerData', playersDb[id]); } });
-            broadcastLeaderboard();
-        }
-      });
-
-      socket.on('disconnect', () => {
-        for (const roomId in rooms) {
-          const room = rooms[roomId];
-          if (room.host === socket.id || room.clients.some(c => c.id === socket.id)) {
-            io.to(roomId).emit('errorMsg', 'Gracz opuścił grę! Pokój zamknięty.');
-            delete rooms[roomId];
-          }
-        }
-      });
-  } catch(err) { console.error("Critical Socket Error: ", err); }
+const io = new Server(server, {
+  cors: { origin: "*", methods: ["GET", "POST"] }
 });
 
-const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log(`Serwer działa na porcie ${PORT}`)); 
+const PORT = process.env.PORT || 3001;
+
+// Struktura pokoju: { id, host, players: [{ id, role, name }], inputs: {}, state: {}, limit, timeLimit, is2v2 }
+const rooms = new Map();
+
+// Struktura gracza: { id, elo, wins, losses, name }
+const players = new Map();
+
+// ==========================================
+// WALIDACJA UNIKALNYCH NAZW GRACZY
+// ==========================================
+function isNameTakenInRoom(roomId, playerName) {
+  const room = rooms.get(roomId);
+  if (!room) return false;
+  return room.players.some(p => p.name.toLowerCase() === playerName.toLowerCase());
+}
+
+// ==========================================
+// TWORZENIE POKOJU
+// ==========================================
+io.on('connection', (socket) => {
+  console.log(`[${socket.id}] połączono`);
+
+  // Pobierz dane gracza
+  socket.on('getPlayerData', () => {
+    if (!players.has(socket.id)) {
+      players.set(socket.id, { id: socket.id, elo: 1200, wins: 0, losses: 0, name: '' });
+    }
+    socket.emit('playerData', players.get(socket.id));
+  });
+
+  // Pobierz ranking
+  socket.on('getLeaderboard', () => {
+    const sorted = Array.from(players.values()).sort((a, b) => b.elo - a.elo).slice(0, 20);
+    socket.emit('leaderboardData', sorted);
+  });
+
+  // ==========================================
+  // TWORZENIE POKOJU (HOST)
+  // ==========================================
+  socket.on('createRoom', ({ limit, timeLimit, is2v2, playerName }) => {
+    const roomId = Math.random().toString(36).substring(2, 6).toUpperCase();
+    const name = playerName || `Player_${socket.id.substring(0, 4)}`;
+    
+    rooms.set(roomId, {
+      id: roomId,
+      host: socket.id,
+      players: [{ id: socket.id, role: 'p1', name }],
+      inputs: {},
+      state: null,
+      limit,
+      timeLimit,
+      is2v2
+    });
+
+    socket.join(roomId);
+    socket.emit('roomCreated', { roomId, role: 'p1' });
+    console.log(`[${socket.id}] utworzył pokój ${roomId} jako ${name}`);
+  });
+
+  // ==========================================
+  // DOŁĄCZANIE DO POKOJU (CLIENT)
+  // ==========================================
+  socket.on('joinRoom', ({ roomId, playerName }) => {
+    const room = rooms.get(roomId);
+    if (!room) return socket.emit('errorMsg', 'Pokój nie istnieje!');
+
+    const name = playerName || `Player_${socket.id.substring(0, 4)}`;
+
+    // ✅ WALIDACJA: Sprawdź czy nazwa jest już zajęta
+    if (isNameTakenInRoom(roomId, name)) {
+      return socket.emit('errorMsg', `Nazwa "${name}" jest już zajęta w tym pokoju!`);
+    }
+
+    const maxPlayers = room.is2v2 ? 4 : 2;
+    if (room.players.length >= maxPlayers) {
+      return socket.emit('errorMsg', 'Pokój jest pełny!');
+    }
+
+    const availableRoles = room.is2v2 ? ['p1', 'p2', 'p3', 'p4'] : ['p1', 'p2'];
+    const takenRoles = room.players.map(p => p.role);
+    const role = availableRoles.find(r => !takenRoles.includes(r));
+
+    room.players.push({ id: socket.id, role, name });
+    socket.join(roomId);
+    socket.emit('joinedRoom', { roomId, role });
+
+    // Wyślij aktualizację lobby do wszystkich w pokoju
+    io.to(roomId).emit('lobbyUpdate', { joined: room.players.length, max: maxPlayers });
+    console.log(`[${socket.id}] dołączył do pokoju ${roomId} jako ${name} (${role})`);
+
+    // Jeśli pokój jest pełny, rozpocznij grę
+    if (room.players.length === maxPlayers) {
+      io.to(roomId).emit('gameStarted', { limit: room.limit, timeLimit: room.timeLimit, is2v2: room.is2v2 });
+      console.log(`[${roomId}] GRA ROZPOCZĘTA!`);
+    }
+  });
+
+  // ==========================================
+  // INPUT OD KLIENTA
+  // ==========================================
+  socket.on('clientInput', ({ roomId, role, input }) => {
+    const room = rooms.get(roomId);
+    if (!room) return;
+    room.inputs[role] = input;
+    socket.to(roomId).emit('opponentInput', { role, input });
+  });
+
+  // ==========================================
+  // STAN GRY OD HOSTA
+  // ==========================================
+  socket.on('hostState', ({ roomId, state }) => {
+    const room = rooms.get(roomId);
+    if (!room || socket.id !== room.host) return;
+    room.state = state;
+    socket.to(roomId).emit('gameState', state);
+  });
+
+  // ==========================================
+  // EVENTY (DŹWIĘK, WSTRZĄSY, REMATCH)
+  // ==========================================
+  socket.on('gameEvent', ({ roomId, type, power }) => {
+    socket.to(roomId).emit('triggerEvent', { type, power });
+  });
+
+  // ==========================================
+  // CZAT
+  // ==========================================
+  socket.on('chatMessage', (msgObj) => {
+    io.to(msgObj.roomId).emit('chatMessage', msgObj);
+  });
+
+  // ==========================================
+  // ZAKOŃCZENIE MECZU (ELO)
+  // ==========================================
+  socket.on('matchComplete', ({ roomId, winnerTeam }) => {
+    const room = rooms.get(roomId);
+    if (!room) return;
+
+    const winnerPlayers = room.players.filter(p => (p.role === 'p1' || p.role === 'p3') ? winnerTeam === 'a' : winnerTeam === 'b');
+    const loserPlayers = room.players.filter(p => !winnerPlayers.includes(p));
+
+    winnerPlayers.forEach(wp => {
+      const playerData = players.get(wp.id);
+      if (playerData) {
+        playerData.elo += 25;
+        playerData.wins++;
+      }
+    });
+
+    loserPlayers.forEach(lp => {
+      const playerData = players.get(lp.id);
+      if (playerData) {
+        playerData.elo = Math.max(800, playerData.elo - 20);
+        playerData.losses++;
+      }
+    });
+
+    console.log(`[${roomId}] Mecz zakończony. Wygrana: ${winnerTeam}`);
+  });
+
+  // ==========================================
+  // ROZŁĄCZENIE
+  // ==========================================
+  socket.on('disconnect', () => {
+    rooms.forEach((room, roomId) => {
+      const idx = room.players.findIndex(p => p.id === socket.id);
+      if (idx !== -1) {
+        room.players.splice(idx, 1);
+        if (room.players.length === 0) {
+          rooms.delete(roomId);
+          console.log(`[${roomId}] Pokój zamknięty (wszyscy wyszli)`);
+        } else {
+          io.to(roomId).emit('lobbyUpdate', { joined: room.players.length, max: room.is2v2 ? 4 : 2 });
+        }
+      }
+    });
+    console.log(`[${socket.id}] rozłączono`);
+  });
+});
+
+server.listen(PORT, () => console.log(`🚀 Serwer działa na porcie ${PORT}`));
