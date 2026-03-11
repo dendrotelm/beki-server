@@ -13,17 +13,9 @@ const io = new Server(server, {
 
 const PORT = process.env.PORT || 3001;
 
-// Struktura pokoju: { id, host, players: [{ id, role, name }], inputs: {}, state: {}, limit, timeLimit, is2v2 }
 const rooms = new Map();
-
-// Struktura gracza: { id, elo, wins, losses, name }
-// Struktura gracza: { name, points, wins, losses }
-// Zmieniamy klucz na nazwę gracza, by punkty nie znikały po odświeżeniu strony!
 const players = new Map();
 
-// ==========================================
-// WALIDACJA UNIKALNYCH NAZW GRACZY
-// ==========================================
 function isNameTakenInRoom(roomId, playerName) {
   const room = rooms.get(roomId);
   if (!room) return false;
@@ -33,30 +25,35 @@ function isNameTakenInRoom(roomId, playerName) {
 io.on('connection', (socket) => {
   console.log(`[${socket.id}] połączono`);
 
-  // Nowa rejestracja gracza (po Nickname, a nie ID)
   socket.on('registerPlayer', (name) => {
     const pName = name || `Player_${socket.id.substring(0, 4)}`;
     if (!players.has(pName)) {
-      players.set(pName, { name: pName, points: 0, wins: 0, losses: 0 }); // Wyzerowany ranking!
+      players.set(pName, { name: pName, points: 0, wins: 0, losses: 0 }); 
     }
     socket.emit('playerData', players.get(pName));
   });
 
-  // Pobierz ranking (sortowanie po punktach)
   socket.on('getLeaderboard', () => {
     const sorted = Array.from(players.values()).sort((a, b) => b.points - a.points).slice(0, 20);
     socket.emit('leaderboardData', sorted);
   });
 
   // ==========================================
-  // TWORZENIE I DOŁĄCZANIE (zostaje tak samo, bez zmian)
+  // LOBBY I DOŁĄCZANIE (HAXBALL STYLE)
   // ==========================================
   socket.on('createRoom', ({ limit, timeLimit, is2v2, playerName }) => {
     const roomId = Math.random().toString(36).substring(2, 6).toUpperCase();
     const name = playerName || `Player_${socket.id.substring(0, 4)}`;
-    rooms.set(roomId, { id: roomId, host: socket.id, players: [{ id: socket.id, role: 'p1', name }], inputs: {}, state: null, limit, timeLimit, is2v2 });
+    
+    rooms.set(roomId, { 
+        id: roomId, host: socket.id, 
+        players: [{ id: socket.id, role: 'p1', name, ready: true }], // Host jest zawsze gotowy
+        inputs: {}, state: null, limit, timeLimit, is2v2 
+    });
+    
     socket.join(roomId);
     socket.emit('roomCreated', { roomId, role: 'p1' });
+    io.to(roomId).emit('lobbyUpdate', { joined: 1, max: is2v2 ? 4 : 2, players: rooms.get(roomId).players, host: socket.id });
   });
 
   socket.on('joinRoom', ({ roomId, playerName }) => {
@@ -71,24 +68,42 @@ io.on('connection', (socket) => {
     const takenRoles = room.players.map(p => p.role);
     const role = availableRoles.find(r => !takenRoles.includes(r));
 
-    room.players.push({ id: socket.id, role, name });
+    // Klient wchodzi jako NOT READY
+    room.players.push({ id: socket.id, role, name, ready: false });
     socket.join(roomId);
     socket.emit('joinedRoom', { roomId, role });
-    io.to(roomId).emit('lobbyUpdate', { joined: room.players.length, max: maxPlayers });
+    io.to(roomId).emit('lobbyUpdate', { joined: room.players.length, max: maxPlayers, players: room.players, host: room.host });
+  });
+
+  socket.on('toggleReady', ({ roomId }) => {
+    const room = rooms.get(roomId);
+    if (!room) return;
+    const p = room.players.find(x => x.id === socket.id);
+    if (p && room.host !== socket.id) {
+        p.ready = !p.ready;
+        io.to(roomId).emit('lobbyUpdate', { joined: room.players.length, max: room.is2v2 ? 4 : 2, players: room.players, host: room.host });
+    }
+  });
+
+  socket.on('startMatch', ({ roomId }) => {
+    const room = rooms.get(roomId);
+    if (!room || room.host !== socket.id) return;
     
-    if (room.players.length === maxPlayers) {
-      io.to(roomId).emit('gameStarted', { limit: room.limit, timeLimit: room.timeLimit, is2v2: room.is2v2 });
+    const allReady = room.players.every(p => p.ready);
+    const maxPlayers = room.is2v2 ? 4 : 2;
+    
+    if (allReady && room.players.length === maxPlayers) {
+        io.to(roomId).emit('gameStarted', { limit: room.limit, timeLimit: room.timeLimit, is2v2: room.is2v2 });
     }
   });
 
   // ==========================================
-  // INPUT I STATE - UŻYWAMY VOLATILE DO REDUKCJI LAGÓW
+  // IN-GAME
   // ==========================================
   socket.on('clientInput', ({ roomId, role, input }) => {
     const room = rooms.get(roomId);
     if (!room) return;
     room.inputs[role] = input;
-    // Volatile odrzuca opóźnione pakiety zamiast je dławić
     socket.volatile.to(roomId).emit('opponentInput', { role, input }); 
   });
 
@@ -96,7 +111,6 @@ io.on('connection', (socket) => {
     const room = rooms.get(roomId);
     if (!room || socket.id !== room.host) return;
     room.state = state;
-    // Volatile do wysyłania 60 razy na sekundę bez zapchania sieci
     socket.volatile.to(roomId).emit('gameState', state); 
   });
 
@@ -108,9 +122,6 @@ io.on('connection', (socket) => {
     io.to(msgObj.roomId).emit('chatMessage', msgObj);
   });
 
-  // ==========================================
-  // ZAKOŃCZENIE MECZU (PUNKTACJA)
-  // ==========================================
   socket.on('matchComplete', ({ roomId, winnerTeam }) => {
     const room = rooms.get(roomId);
     if (!room) return;
@@ -118,22 +129,14 @@ io.on('connection', (socket) => {
     const winnerPlayers = room.players.filter(p => (p.role === 'p1' || p.role === 'p3') ? winnerTeam === 'a' : winnerTeam === 'b');
     const loserPlayers = room.players.filter(p => !winnerPlayers.includes(p));
 
-    // Dodajemy po 15 punktów za wygraną
     winnerPlayers.forEach(wp => {
       const playerData = players.get(wp.name);
-      if (playerData) {
-        playerData.points += 15;
-        playerData.wins++;
-      }
+      if (playerData) { playerData.points += 15; playerData.wins++; }
     });
 
-    // Odejmujemy 5 punktów za przegraną (nie spadnie poniżej 0)
     loserPlayers.forEach(lp => {
       const playerData = players.get(lp.name);
-      if (playerData) {
-        playerData.points = Math.max(0, playerData.points - 5);
-        playerData.losses++;
-      }
+      if (playerData) { playerData.points = Math.max(0, playerData.points - 5); playerData.losses++; }
     });
   });
 
@@ -141,9 +144,19 @@ io.on('connection', (socket) => {
     rooms.forEach((room, roomId) => {
       const idx = room.players.findIndex(p => p.id === socket.id);
       if (idx !== -1) {
+        const p = room.players[idx];
         room.players.splice(idx, 1);
-        if (room.players.length === 0) rooms.delete(roomId);
-        else io.to(roomId).emit('lobbyUpdate', { joined: room.players.length, max: room.is2v2 ? 4 : 2 });
+        if (room.players.length === 0) {
+            rooms.delete(roomId);
+        } else {
+            // Re-assign host if host left
+            if (room.host === socket.id) {
+                room.host = room.players[0].id;
+                room.players[0].ready = true; 
+            }
+            io.to(roomId).emit('lobbyUpdate', { joined: room.players.length, max: room.is2v2 ? 4 : 2, players: room.players, host: room.host });
+            io.to(roomId).emit('playerLeft', { role: p.role });
+        }
       }
     });
   });
