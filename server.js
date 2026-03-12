@@ -24,6 +24,14 @@ function isNameTakenInRoom(roomId, playerName) {
 
 io.on('connection', (socket) => {
   console.log(`[${socket.id}] połączono`);
+  // Ukryta komenda do resetu rankingu
+  socket.on('adminResetLeaderboard', (password) => {
+    if (password === 'karpatkA!1339') { // Zmień na własne!
+      players.clear(); // Czyści całą mapę graczy
+      io.emit('leaderboardData', []); // Wysyła pusty ranking do wszystkich
+      console.log('Ranking został zresetowany przez admina!');
+    }
+  });
 
   socket.on('registerPlayer', (name) => {
     const pName = name || `Player_${socket.id.substring(0, 4)}`;
