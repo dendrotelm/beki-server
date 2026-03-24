@@ -84,17 +84,9 @@ async function findOrCreatePlayer({ name, secretToken, crazyGamesId, firebaseUid
   if (crazyGamesId) {
     player = await Player.findOne({ crazyGamesId });
     if (player) {
-      // AKTUALIZACJA NICKU: Jeśli nick na CG się zmienił, nadpisz go w bazie
       if (safeName && player.name !== safeName) {
-        try {
-          player.name = safeName;
-          player.isGuest = false;
-          await player.save();
-        } catch (e) {
-          // Jeśli nowy nick jest zajęty, dodaj unikalny przyrostek, aby uniknąć błędu unikalności (E11000)
-          player.name = safeName + '_' + Math.floor(Math.random() * 9999);
-          await player.save();
-        }
+        try { player.name = safeName; player.isGuest = false; await player.save(); } 
+        catch (e) { player.name = safeName + '_' + Math.floor(Math.random() * 9999); await player.save(); }
       }
       return { player, error: null };
     }
@@ -106,7 +98,23 @@ async function findOrCreatePlayer({ name, secretToken, crazyGamesId, firebaseUid
     if (player) return { player, error: null };
   }
 
-  // 3. Szukaj po nazwie (fallback) i linkowanie konta
+  // 3. ZAPOBIEGANIE SPAMOWI NICKÓW: Szukaj po secretToken (Zwykły gracz Web zmieniający nick)
+  if (secretToken && !crazyGamesId && !firebaseUid) {
+    player = await Player.findOne({ secretToken });
+    if (player) {
+      // Znaleziono gracza! Zobaczmy, czy zmienia nick.
+      if (safeName && player.name !== safeName) {
+        const nameTaken = await Player.findOne({ name: safeName });
+        if (nameTaken) return { player: null, error: 'nameTakenError' }; // Nick zajęty
+        player.name = safeName;
+        player.isGuest = safeName.startsWith('Player_');
+        await player.save();
+      }
+      return { player, error: null };
+    }
+  }
+
+  // 4. Szukaj po nazwie (stare konta bez tokena lub łączenie kont)
   if (safeName) {
     player = await Player.findOne({ name: safeName });
     if (player) {
@@ -114,17 +122,16 @@ async function findOrCreatePlayer({ name, secretToken, crazyGamesId, firebaseUid
       if (!isGuest && player.secretToken && !crazyGamesId && !firebaseUid) {
         if (player.secretToken !== secretToken) return { player: null, error: 'nameTakenError' };
       }
-      // Linkowanie konta w locie
       if (crazyGamesId && !player.crazyGamesId) { player.crazyGamesId = crazyGamesId; player.isGuest = false; await player.save(); }
       if (firebaseUid && !player.firebaseUid) { player.firebaseUid = firebaseUid; player.isGuest = false; await player.save(); }
       return { player, error: null };
     }
   }
 
-  // 4. Tworzenie nowego gracza
+  // 5. Tworzenie nowego gracza
   const finalName = safeName || `Player_${Math.random().toString(36).substr(2, 6)}`;
   const isGuest = finalName.startsWith('Player_') && !crazyGamesId && !firebaseUid;
-  const newToken = Math.random().toString(36).substring(2, 15);
+  const newToken = secretToken || Math.random().toString(36).substring(2, 15);
 
   player = new Player({ name: finalName, isGuest, secretToken: newToken, crazyGamesId, firebaseUid });
 
