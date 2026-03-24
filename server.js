@@ -6,8 +6,8 @@ const { Server } = require('socket.io');
 const cors = require('cors');
 const mongoose = require('mongoose');
 const admin = require('firebase-admin');
-const fetch = require('node-fetch'); 
-const jwt = require('jsonwebtoken'); 
+const fetch = require('node-fetch');
+const jwt = require('jsonwebtoken');
 
 // ==========================================
 // FIREBASE ADMIN INIT
@@ -40,7 +40,7 @@ const playerSchema = new mongoose.Schema({
   secretToken: { type: String },
   crazyGamesId: { type: String },
   firebaseUid: { type: String },
-  leaveWarnings: { type: Number, default: 0 }, 
+  leaveWarnings: { type: Number, default: 0 },
 });
 
 playerSchema.index({ crazyGamesId: 1 }, { sparse: true });
@@ -73,20 +73,40 @@ async function verifyFirebaseToken(idToken) {
   } catch (e) { return null; }
 }
 
+// ==========================================
+// HELPER: znajdź lub utwórz gracza
+// ==========================================
 async function findOrCreatePlayer({ name, secretToken, crazyGamesId, firebaseUid }) {
   let player = null;
   const safeName = (name && typeof name === 'string') ? name.trim() : null;
 
+  // 1. Szukaj po crazyGamesId
   if (crazyGamesId) {
     player = await Player.findOne({ crazyGamesId });
-    if (player) return { player, error: null };
+    if (player) {
+      // AKTUALIZACJA NICKU: Jeśli nick na CG się zmienił, nadpisz go w bazie
+      if (safeName && player.name !== safeName) {
+        try {
+          player.name = safeName;
+          player.isGuest = false;
+          await player.save();
+        } catch (e) {
+          // Jeśli nowy nick jest zajęty, dodaj unikalny przyrostek, aby uniknąć błędu unikalności (E11000)
+          player.name = safeName + '_' + Math.floor(Math.random() * 9999);
+          await player.save();
+        }
+      }
+      return { player, error: null };
+    }
   }
 
+  // 2. Szukaj po firebaseUid
   if (firebaseUid) {
     player = await Player.findOne({ firebaseUid });
     if (player) return { player, error: null };
   }
 
+  // 3. Szukaj po nazwie (fallback) i linkowanie konta
   if (safeName) {
     player = await Player.findOne({ name: safeName });
     if (player) {
@@ -94,12 +114,14 @@ async function findOrCreatePlayer({ name, secretToken, crazyGamesId, firebaseUid
       if (!isGuest && player.secretToken && !crazyGamesId && !firebaseUid) {
         if (player.secretToken !== secretToken) return { player: null, error: 'nameTakenError' };
       }
-      if (crazyGamesId && !player.crazyGamesId) { player.crazyGamesId = crazyGamesId; await player.save(); }
-      if (firebaseUid && !player.firebaseUid) { player.firebaseUid = firebaseUid; await player.save(); }
+      // Linkowanie konta w locie
+      if (crazyGamesId && !player.crazyGamesId) { player.crazyGamesId = crazyGamesId; player.isGuest = false; await player.save(); }
+      if (firebaseUid && !player.firebaseUid) { player.firebaseUid = firebaseUid; player.isGuest = false; await player.save(); }
       return { player, error: null };
     }
   }
 
+  // 4. Tworzenie nowego gracza
   const finalName = safeName || `Player_${Math.random().toString(36).substr(2, 6)}`;
   const isGuest = finalName.startsWith('Player_') && !crazyGamesId && !firebaseUid;
   const newToken = Math.random().toString(36).substring(2, 15);
@@ -184,7 +206,7 @@ setInterval(() => {
 // SOCKET.IO HANDLERS
 // ==========================================
 io.on('connection', (socket) => {
-  
+
   socket.on('pingOnline', (clientId) => {
     activeClients.set(socket.id, clientId);
     updateOnlineCount();
@@ -310,7 +332,7 @@ io.on('connection', (socket) => {
     const room = rooms.get(roomId);
     if (!room || room.isFinished) return;
     room.isFinished = true;
-    
+
     // Tylko mecze rankingowe dają/zabierają punkty
     if (room.isRanked || roomId.startsWith('RNK_')) {
         const winnerPlayers = room.players.filter(p => (p.role==='p1'||p.role==='p3') ? winnerTeam==='a' : winnerTeam==='b');
@@ -345,12 +367,12 @@ io.on('connection', (socket) => {
       const idx = room.players.findIndex(p => p.id === socket.id);
       if (idx !== -1) {
         const p = room.players[idx];
-        
+
         // ZAWODNIK WYSZEDŁ PODCZAS MECZU
         if (!room.isFinished && (room.players.every(pl => pl.ready) && room.players.length === (room.is2v2 ? 4 : 2))) {
           room.isFinished = true;
           const remaining = room.players.filter(rp => rp.id !== socket.id);
-          
+
           if (room.isRanked || roomId.startsWith('RNK_')) {
             // Rankingowy - kara dla uciekiniera, walkower dla zostającego
             remaining.forEach(async rem => {
@@ -376,7 +398,7 @@ io.on('connection', (socket) => {
               const lb = await Player.find({ isGuest: false }).sort({ points: -1 }).limit(20);
               io.emit('leaderboardData', lb);
             } catch(e) { console.log(e); }
-            
+
           } else {
              // Towarzyski - tylko info o wyjściu
              remaining.forEach(rem => {
@@ -384,7 +406,7 @@ io.on('connection', (socket) => {
              });
           }
         }
-        
+
         room.players.splice(idx, 1);
         if (room.players.length === 0) { rooms.delete(roomId); }
         else {
