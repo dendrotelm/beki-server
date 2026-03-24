@@ -38,9 +38,10 @@ const playerSchema = new mongoose.Schema({
   wins: { type: Number, default: 0 },
   losses: { type: Number, default: 0 },
   isGuest: { type: Boolean, default: false },
-  secretToken: { type: String },       // itch.io / fallback
-  crazyGamesId: { type: String },      // CrazyGames userId z JWT
-  firebaseUid: { type: String },       // Firebase uid (Google, Android)
+  secretToken: { type: String },
+  crazyGamesId: { type: String },
+  firebaseUid: { type: String },
+  leaveWarnings: { type: Number, default: 0 }, // licznik opuszczeń w trakcie meczu
 });
 
 // Indeksy żeby wyszukiwanie było szybkie
@@ -220,6 +221,8 @@ setInterval(() => {
 // ==========================================
 io.on('connection', (socket) => {
   console.log(`[${socket.id}] połączono`);
+  const broadcastOnlineCount = () => io.emit('onlineCount', io.engine.clientsCount);
+  broadcastOnlineCount(); // broadcast przy każdym nowym połączeniu
 
   socket.on('adminResetLeaderboard', async (password) => {
     if (password === process.env.ADMIN_PASSWORD) {
@@ -402,6 +405,7 @@ io.on('connection', (socket) => {
   });
 
   socket.on('disconnect', () => {
+    setTimeout(broadcastOnlineCount, 100); // lekkie opóźnienie — socket.io aktualizuje licznik asynchronicznie
     matchmakingQueue = matchmakingQueue.filter(q => q.socket.id !== socket.id);
     rooms.forEach(async (room, roomId) => {
       const idx = room.players.findIndex(p => p.id === socket.id);
@@ -413,9 +417,39 @@ io.on('connection', (socket) => {
           if (remaining) {
             try {
               const leaver = await Player.findOne({ name: p.name });
-              if (leaver) { leaver.points = Math.max(0, leaver.points - 10); leaver.losses++; await leaver.save(); }
+              if (leaver && !leaver.isGuest) {
+                leaver.leaveWarnings = (leaver.leaveWarnings || 0) + 1;
+                const warns = leaver.leaveWarnings;
+
+                // System kar:
+                // 1. ostrzeżenie — 0 punktów
+                // co 3 wyjścia: -5 pkt
+                // pozostałe: -2 pkt
+                let pointPenalty = 0;
+                if (warns === 1) {
+                  pointPenalty = 0; // tylko ostrzeżenie
+                } else if (warns % 3 === 0) {
+                  pointPenalty = 5; // co 3. wyjście surowa kara
+                } else {
+                  pointPenalty = 2; // każde inne wyjście
+                }
+
+                leaver.points = Math.max(0, leaver.points - pointPenalty);
+                leaver.losses++;
+                await leaver.save();
+
+                // Informuj leavera o jego karze (może jeszcze być połączony przez chwilę)
+                socket.emit('leavepenalty', {
+                  warnings: warns,
+                  pointPenalty,
+                });
+              }
+
               const winner = await Player.findOne({ name: remaining.name });
-              if (winner) { winner.points += 15; winner.wins++; await winner.save(); io.to(remaining.id).emit('playerData', winner); }
+              if (winner) {
+                winner.points += 15; winner.wins++; await winner.save();
+                io.to(remaining.id).emit('playerData', winner);
+              }
               const lb = await Player.find({ isGuest: false }).sort({ points: -1 }).limit(20);
               io.emit('leaderboardData', lb);
             } catch(e) { console.log(e); }
