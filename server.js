@@ -92,6 +92,9 @@ async function verifyFirebaseToken(idToken) {
 async function findOrCreatePlayer({ name, secretToken, crazyGamesId, firebaseUid }) {
   let player = null;
 
+  // Zabezpieczenie: upewnij się że name to string lub null
+  const safeName = (name && typeof name === 'string') ? name.trim() : null;
+
   // 1. Szukaj po crazyGamesId
   if (crazyGamesId) {
     player = await Player.findOne({ crazyGamesId });
@@ -105,12 +108,12 @@ async function findOrCreatePlayer({ name, secretToken, crazyGamesId, firebaseUid
   }
 
   // 3. Szukaj po nazwie (fallback localStorage)
-  if (name) {
-    player = await Player.findOne({ name });
+  if (safeName) {
+    player = await Player.findOne({ name: safeName });
 
     if (player) {
       // Nick istnieje — weryfikuj token (tylko dla niegości)
-      const isGuest = name.startsWith('Player_');
+      const isGuest = safeName.startsWith('Player_');
       if (!isGuest && player.secretToken && !crazyGamesId && !firebaseUid) {
         if (player.secretToken !== secretToken) {
           return { player: null, error: 'nameTakenError' };
@@ -130,7 +133,7 @@ async function findOrCreatePlayer({ name, secretToken, crazyGamesId, firebaseUid
   }
 
   // 4. Nowy gracz — utwórz
-  const finalName = name || `Player_${Math.random().toString(36).substr(2, 6)}`;
+  const finalName = safeName || `Player_${Math.random().toString(36).substr(2, 6)}`;
   const isGuest = finalName.startsWith('Player_') && !crazyGamesId && !firebaseUid;
   const newToken = Math.random().toString(36).substring(2, 15);
 
@@ -231,7 +234,8 @@ io.on('connection', (socket) => {
   // Dane: { name, secretToken, platform, cgToken, firebaseToken }
   // ==========================================
   socket.on('registerPlayer', async (data) => {
-    // Backward compat: stary kod mógł wysłać string
+    // Zabezpieczenie: data może być null/undefined ze starego klienta
+    if (!data) data = {};
     if (typeof data === 'string') data = { name: data };
 
     const { name, secretToken, platform, cgToken, firebaseToken } = data;
